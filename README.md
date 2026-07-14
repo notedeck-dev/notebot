@@ -52,7 +52,14 @@ cargo run --example echo        # bot 起動
 
 ## ステータス
 
-設計フェーズ。詳細は [ARCHITECTURE.md](ARCHITECTURE.md) を参照。
+M1 (echo bot が動く最小構成) 実装済み: `on_mention` + `Ctx::reply/post/react`、
+自己応答ループ防止、`isBot` 無視、visibility 継承 (public→home 丸め)、
+DM (specified) 返信対応。次は M2 (command router + 残りの安全装置)。
+設計の詳細は [ARCHITECTURE.md](ARCHITECTURE.md) を参照。
+
+```sh
+cargo run --example echo   # メンションをオウム返しする bot
+```
 
 ## License
 
