@@ -3,8 +3,10 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      # 未指定なら notecli の先頭アカウント
-      NOTEBOT_ACCOUNT: ${NOTEBOT_ACCOUNT:-}
+      NOTEBOT_HOST: ${NOTEBOT_HOST:?set NOTEBOT_HOST in .env}
+      # docker secrets を使う場合は NOTEBOT_TOKEN_FILE に切り替える
+      NOTEBOT_TOKEN: ${NOTEBOT_TOKEN:-}
+      NOTEBOT_TOKEN_FILE: ${NOTEBOT_TOKEN_FILE:-}
       RUST_LOG: ${RUST_LOG:-notebot=info,notecli=warn}
     volumes:
       - notebot-data:/data

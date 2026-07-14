@@ -6,6 +6,8 @@ pub enum NotebotError {
     AccountNotFound(String),
     #[error("unexpected API response: {0}")]
     UnexpectedResponse(String),
+    #[error("configuration error: {0}")]
+    Config(String),
 }
 
 pub type Result<T> = std::result::Result<T, NotebotError>;

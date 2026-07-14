@@ -63,21 +63,34 @@ cargo run --example echo   # メンションをオウム返しする bot
 
 ## Docker Compose での運用
 
-```sh
-docker compose build
-docker compose run --rm bot notecli login misskey.example   # 初回のみ: コンテナ内でログイン
-docker compose up -d
-docker compose logs -f bot
-```
+トークンは `.env` から環境変数で注入する。**DB やイメージには書かれない。**
 
-- トークンは named volume (`notebot-data`) 内の notecli.db に保存される。
-  コンテナでは OS キーチェーンが使えないため keyring 無効でビルドしている
-- **ホストで `notecli login` したアカウントは使えない**（トークンがホストの
-  キーチェーンにあり、volume を共有しても DB には無い）。必ず上記のとおり
-  コンテナ内でログインすること
+1. bot アカウントで Misskey Web にログインし、設定 → API →
+   アクセストークンの発行（権限は「ノートを作成・削除する」「リアクションを
+   追加・削除する」程度に絞れる）
+2. リポジトリ直下に `.env` を作成（.gitignore / .dockerignore 済み）:
+
+   ```sh
+   NOTEBOT_HOST=misskey.example
+   NOTEBOT_TOKEN=<発行したトークン>
+   ```
+
+3. 起動:
+
+   ```sh
+   docker compose up -d --build
+   docker compose logs -f bot
+   ```
+
+- docker secrets 等でファイル渡しする場合は `NOTEBOT_TOKEN` の代わりに
+  `NOTEBOT_TOKEN_FILE=/run/secrets/notebot_token`
 - 別の bot を動かす場合: `docker compose build --build-arg EXAMPLE=<name>`
   （`examples/<name>.rs` をビルドする）
-- アカウント指定は `.env` の `NOTEBOT_ACCOUNT=@bot@host`
+- volume (`notebot-data`) にはノートキャッシュのみが残る
+
+ローカル開発では従来どおり `notecli login` したアカウント
+（OS キーチェーン保管）が使える。`NOTEBOT_TOKEN` が設定されていれば
+そちらが優先される。
 
 ## License
 

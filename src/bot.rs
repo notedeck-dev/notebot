@@ -79,10 +79,9 @@ impl Bot {
     /// bot を起動し、SIGINT/SIGTERM まで動き続ける。
     pub async fn run(self) -> Result<()> {
         let db = Arc::new(Database::open(&notecli_db_path())?);
-        let spec = std::env::var("NOTEBOT_ACCOUNT").ok().or(self.account_spec.clone());
-        let account = resolve_account(&db, spec.as_deref())?;
-        let (host, token) = notecli::get_credentials(&db, &account.id)?;
-        tracing::info!(account = %format!("@{}@{}", account.username, host), "starting bot");
+        let client = Arc::new(MisskeyClient::new()?);
+        let creds = self.resolve_credentials(&db, &client).await?;
+        tracing::info!(account = %format!("@{}@{}", creds.username, creds.host), "starting bot");
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let manager = StreamingManager::new(
@@ -90,15 +89,15 @@ impl Bot {
             Arc::new(EventBus::new()),
             db.clone(),
         );
-        manager.connect(&account.id, &host, &token).await?;
-        manager.subscribe_main(&account.id).await?;
+        manager.connect(&creds.account_id, &creds.host, &creds.token).await?;
+        manager.subscribe_main(&creds.account_id).await?;
 
-        let client = Arc::new(MisskeyClient::new()?);
+        let account_id = creds.account_id.clone();
         let bot_account = Arc::new(BotAccount {
-            id: account.id.clone(),
-            host,
-            token,
-            user_id: account.user_id.clone(),
+            id: creds.account_id,
+            host: creds.host,
+            token: creds.token,
+            user_id: creds.user_id,
         });
 
         loop {
@@ -113,8 +112,59 @@ impl Bot {
                 }
             }
         }
-        manager.disconnect(&account.id).await;
+        manager.disconnect(&account_id).await;
         Ok(())
+    }
+
+    /// 認証情報の解決。優先順:
+    /// 1. `NOTEBOT_TOKEN` (または `NOTEBOT_TOKEN_FILE`) + `NOTEBOT_HOST` —
+    ///    トークンを DB に書かない直接注入。コンテナ運用の既定経路
+    /// 2. notecli のアカウント (keychain / DB) — ローカル運用
+    async fn resolve_credentials(
+        &self,
+        db: &Database,
+        client: &MisskeyClient,
+    ) -> Result<Credentials> {
+        let env_token = read_env_token(
+            std::env::var("NOTEBOT_TOKEN").ok(),
+            std::env::var("NOTEBOT_TOKEN_FILE").ok(),
+        )?;
+        if let Some(token) = env_token {
+            let host = std::env::var("NOTEBOT_HOST").ok().filter(|h| !h.is_empty()).ok_or_else(|| {
+                NotebotError::Config("NOTEBOT_TOKEN is set but NOTEBOT_HOST is missing".into())
+            })?;
+            // `i` で自分自身を取得 — トークン検証を兼ねる。user_id は
+            // 自己応答ループ防止に必須
+            let me = client.request(&host, &token, "i", serde_json::json!({})).await?;
+            let user_id = me
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| NotebotError::UnexpectedResponse("i: no id field".into()))?
+                .to_string();
+            let username = me
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)")
+                .to_string();
+            return Ok(Credentials {
+                account_id: format!("env:{user_id}@{host}"),
+                host,
+                token,
+                user_id,
+                username,
+            });
+        }
+
+        let spec = std::env::var("NOTEBOT_ACCOUNT").ok().or_else(|| self.account_spec.clone());
+        let account = resolve_account(db, spec.as_deref())?;
+        let (host, token) = notecli::get_credentials(db, &account.id)?;
+        Ok(Credentials {
+            account_id: account.id.clone(),
+            host,
+            token,
+            user_id: account.user_id.clone(),
+            username: account.username.clone(),
+        })
     }
 
     fn handle_event(
@@ -152,6 +202,38 @@ impl Bot {
             }
         }
     }
+}
+
+struct Credentials {
+    account_id: String,
+    host: String,
+    token: String,
+    user_id: String,
+    username: String,
+}
+
+/// `NOTEBOT_TOKEN` / `NOTEBOT_TOKEN_FILE` からトークンを読む。
+/// 前者が優先。どちらも無ければ None (notecli アカウントへフォールバック)。
+fn read_env_token(token: Option<String>, token_file: Option<String>) -> Result<Option<String>> {
+    if let Some(t) = token {
+        let t = t.trim();
+        if !t.is_empty() {
+            return Ok(Some(t.to_string()));
+        }
+    }
+    if let Some(path) = token_file.filter(|p| !p.is_empty()) {
+        let t = std::fs::read_to_string(&path).map_err(|e| {
+            NotebotError::Config(format!("failed to read NOTEBOT_TOKEN_FILE ({path}): {e}"))
+        })?;
+        let t = t.trim();
+        if t.is_empty() {
+            return Err(NotebotError::Config(format!(
+                "NOTEBOT_TOKEN_FILE ({path}) is empty"
+            )));
+        }
+        return Ok(Some(t.to_string()));
+    }
+    Ok(None)
 }
 
 /// 自己応答ループ防止 (解除不可) と isBot 無視 (オプトアウト可)。
@@ -285,6 +367,36 @@ mod tests {
         assert!(matches!(
             resolve_account(&db, Some("@nobody@nowhere")),
             Err(NotebotError::AccountNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn env_token_prefers_direct_value() {
+        let got = read_env_token(Some(" tok ".into()), Some("/nonexistent".into())).unwrap();
+        assert_eq!(got.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn env_token_reads_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "filetok\n").unwrap();
+        let got = read_env_token(None, Some(path.to_string_lossy().into_owned())).unwrap();
+        assert_eq!(got.as_deref(), Some("filetok"));
+    }
+
+    #[test]
+    fn env_token_absent_falls_back() {
+        assert!(read_env_token(None, None).unwrap().is_none());
+        // 空文字は未設定扱い
+        assert!(read_env_token(Some("".into()), None).unwrap().is_none());
+    }
+
+    #[test]
+    fn env_token_missing_file_is_config_error() {
+        assert!(matches!(
+            read_env_token(None, Some("/nonexistent/token".into())),
+            Err(NotebotError::Config(_))
         ));
     }
 

@@ -207,11 +207,20 @@ bot ごとの複雑な永続化が必要なら利用者が自前の DB を持て
 
 ## 8. 認証と設定
 
-- **認証は notecli に完全委譲**: `notecli login <host>` で MiAuth → OS
-  キーチェーン保存、が唯一のフロー。notebot は
-  `resolve_account()` + `get_credentials()` を呼ぶだけ。
-- bot 側設定は `.account("@bot@host")` のコード指定を基本とし、
-  `NOTEBOT_ACCOUNT` 環境変数でオーバーライド可（デプロイ用）。
+認証情報の解決は 2 経路、優先順:
+
+1. **環境変数直接注入** — `NOTEBOT_TOKEN`（または `NOTEBOT_TOKEN_FILE`、
+   docker secrets 向け）+ `NOTEBOT_HOST`。トークンは Misskey Web の
+   「設定 → API → アクセストークンの発行」で取得する。起動時に `i`
+   エンドポイントで user_id を取得（トークン検証を兼ね、自己応答ループ
+   防止にも必要）。**DB にはトークンもアカウント行も書かない**
+   （`StreamingManager::get_host` は connect 時に渡した host をメモリから
+   返すため、DB のアカウント行は不要 — 実装確認済み）。
+   コンテナ運用の既定経路
+2. **notecli のアカウント** — `notecli login <host>`（MiAuth → OS
+   キーチェーン保存）済みアカウントを `resolve_account()` +
+   `get_credentials()` で解決。`.account("@bot@host")` のコード指定、
+   `NOTEBOT_ACCOUNT` 環境変数でオーバーライド可。ローカル運用向け
 - notecli.db の共有について（実装確認済み）: notecli は
   `PRAGMA journal_mode=WAL` で開くため、CLI と notebot の並行利用は許容
   される。**read-only オープンは不可** — `StreamingManager` が受信ノートを
@@ -219,21 +228,17 @@ bot ごとの複雑な永続化が必要なら利用者が自前の DB を持て
 
 ### コンテナ運用 (Docker Compose)
 
-- コンテナ内では OS キーチェーンが使えない（Docker のデフォルト seccomp が
-  `keyctl`/`add_key` を塞ぐ。仮に通っても kernel keyring は非永続で、
-  notecli の lazy migration が DB トークンをクリアしてしまい再起動で
-  トークンを失う）。よって **Docker ビルドは `--no-default-features`**
-  （notebot の `keyring` feature を落とす）とし、トークンは volume 上の
-  notecli.db に平文で残す。保護はファイルパーミッション頼みになるが、
-  これは notecli 自身の keyring 無効時フォールバックと同じトレードオフ
-- 帰結として、ホストで keyring 有効ログインしたアカウントは volume を
-  共有してもコンテナから読めない（DB 側トークンは移行済みで空）。
-  ログインはコンテナ内 (`docker compose run --rm bot notecli login <host>`)
-  で行う。MiAuth は URL を開いて承認する方式で、コールバック用の
-  ポート開放は不要
-- イメージには example bot (`ARG EXAMPLE`, 既定 echo) と、運用用に同 rev の
-  notecli CLI を同梱する。SIGTERM は `run()` が処理するため
-  `docker stop` で graceful shutdown になる
+- 認証は経路 1（`NOTEBOT_TOKEN` 直接注入）を使う。トークンは `.env`
+  （.gitignore / .dockerignore 対象）から compose が環境変数として渡し、
+  **DB・イメージ・volume には残らない**
+- コンテナ内では OS キーチェーンがどのみち使えない（Docker のデフォルト
+  seccomp が `keyctl`/`add_key` を塞ぐ。仮に通っても kernel keyring は
+  非永続で、notecli の lazy migration が DB トークンをクリアして再起動で
+  トークンを失う）。**Docker ビルドは `--no-default-features`**（notebot の
+  `keyring` feature を落とす）で、keyring 依存ごとコンパイルしない
+- イメージは example bot (`ARG EXAMPLE`, 既定 echo) を `/usr/local/bin/bot`
+  として同梱。SIGTERM は `run()` が処理するため `docker stop` で
+  graceful shutdown になる。volume (`/data`) はノートキャッシュのみ
 
 ## 9. エラー型
 

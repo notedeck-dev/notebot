@@ -10,14 +10,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY examples ./examples
 
-# keyring はコンテナ内で使えない (Docker の seccomp が keyctl を塞ぐ) ため
-# 無効化。トークンは notecli.db (volume) に保管される。
+# 認証は NOTEBOT_TOKEN の直接注入 (トークンを DB に書かない) を使うため、
+# コンテナ内で使えない keyring feature は無効化する。
 RUN cargo build --release --example "${EXAMPLE}" --no-default-features
-
-# 運用用 CLI (login / accounts / doctor)。lib と同じ rev・同じく keyring 無効。
-RUN cargo install --git https://github.com/hitalin/notecli.git \
-    --rev f1931af84a384c749efa2cd5b9aa478d22d19393 \
-    --no-default-features notecli
 
 FROM debian:bookworm-slim
 ARG EXAMPLE=echo
@@ -27,11 +22,11 @@ RUN apt-get update \
     && useradd --create-home bot \
     && mkdir /data && chown bot:bot /data
 
-# dirs::data_dir() がここを見る → /data/notecli/notecli.db
+# dirs::data_dir() がここを見る → /data/notecli/notecli.db (キャッシュのみ、
+# トークンは書かれない)
 ENV XDG_DATA_HOME=/data
 
 COPY --from=builder "/build/target/release/examples/${EXAMPLE}" /usr/local/bin/bot
-COPY --from=builder /usr/local/cargo/bin/notecli /usr/local/bin/notecli
 
 USER bot
 VOLUME /data
