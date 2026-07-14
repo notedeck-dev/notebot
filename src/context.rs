@@ -56,6 +56,17 @@ impl BotHandle {
             .await?)
     }
 
+    /// ユーザーをフォローする (follow back 用)。
+    pub async fn follow(&self, user_id: &str) -> Result<()> {
+        self.gate
+            .send(|| {
+                self.client
+                    .follow_user(&self.account.host, &self.account.token, user_id)
+            })
+            .await?;
+        Ok(())
+    }
+
     /// bot 用 KV ストア。
     pub fn store(&self) -> &Store {
         &self.store
@@ -162,20 +173,16 @@ impl Ctx {
             .bot
             .gate
             .send(|| {
-                self.bot.client.request(
-                    &account.host,
-                    &account.token,
-                    "notes/create",
-                    body.clone(),
-                )
+                self.bot
+                    .client
+                    .request(&account.host, &account.token, "notes/create", body.clone())
             })
             .await?;
-        let created = data
-            .get("createdNote")
-            .cloned()
-            .ok_or_else(|| NotebotError::UnexpectedResponse("notes/create: no createdNote".into()))?;
-        let raw: RawNote = serde_json::from_value(created)
-            .map_err(notecli::error::NoteDeckError::from)?;
+        let created = data.get("createdNote").cloned().ok_or_else(|| {
+            NotebotError::UnexpectedResponse("notes/create: no createdNote".into())
+        })?;
+        let raw: RawNote =
+            serde_json::from_value(created).map_err(notecli::error::NoteDeckError::from)?;
         Ok(raw.normalize(&account.id, &account.host))
     }
 

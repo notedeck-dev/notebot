@@ -3,7 +3,7 @@
 //! notecli の Stream*Event は Serialize のみ derive しているため、
 //! ここでは emit された JSON payload から必要な部分だけを取り出す。
 
-use notecli::models::NormalizedNote;
+use notecli::models::{NormalizedNote, NormalizedNotification};
 use notecli::streaming::FrontendEmitter;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -27,11 +27,18 @@ impl FrontendEmitter for ChannelEmitter {
     }
 }
 
-/// notebot が扱うイベント。M1 では mention と接続状態のみ。
+/// notebot が扱うイベント。
 #[derive(Debug)]
 pub enum BotEvent {
     Mention(Box<NormalizedNote>),
-    Status { state: String },
+    Note {
+        subscription_id: String,
+        note: Box<NormalizedNote>,
+    },
+    Notification(Box<NormalizedNotification>),
+    Status {
+        state: String,
+    },
 }
 
 /// emit されたイベント名 + payload を BotEvent に変換する。
@@ -46,6 +53,28 @@ pub(crate) fn parse_event(name: &str, payload: &Value) -> Option<BotEvent> {
                 None
             }
         },
+        "stream-note" => {
+            let subscription_id = payload.get("subscriptionId")?.as_str()?.to_string();
+            match serde_json::from_value(payload.get("note")?.clone()) {
+                Ok(note) => Some(BotEvent::Note {
+                    subscription_id,
+                    note: Box::new(note),
+                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to deserialize timeline note");
+                    None
+                }
+            }
+        }
+        "stream-notification" => {
+            match serde_json::from_value(payload.get("notification")?.clone()) {
+                Ok(notification) => Some(BotEvent::Notification(Box::new(notification))),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to deserialize notification");
+                    None
+                }
+            }
+        }
         "stream-status" => Some(BotEvent::Status {
             state: payload.get("state")?.as_str()?.to_string(),
         }),
@@ -118,6 +147,48 @@ mod tests {
         assert_eq!(note.id, "n1");
         assert_eq!(note.user.username, "alice");
         assert!(!note.user.is_bot);
+    }
+
+    #[test]
+    fn parses_timeline_note() {
+        let payload = json!({
+            "accountId": "acc1",
+            "subscriptionId": "sub-tl",
+            "note": mention_payload()["note"],
+        });
+        let Some(BotEvent::Note {
+            subscription_id,
+            note,
+        }) = parse_event("stream-note", &payload)
+        else {
+            panic!("expected Note");
+        };
+        assert_eq!(subscription_id, "sub-tl");
+        assert_eq!(note.id, "n1");
+    }
+
+    #[test]
+    fn parses_reaction_notification() {
+        let payload = json!({
+            "accountId": "acc1",
+            "subscriptionId": "sub-main",
+            "notification": {
+                "id": "notif1",
+                "_accountId": "acc1",
+                "_serverHost": "misskey.example",
+                "createdAt": "2026-07-15T00:00:00.000Z",
+                "type": "reaction",
+                "user": { "id": "u1", "username": "alice" },
+                "note": mention_payload()["note"],
+                "reaction": "👍"
+            }
+        });
+        let Some(BotEvent::Notification(n)) = parse_event("stream-notification", &payload) else {
+            panic!("expected Notification");
+        };
+        assert_eq!(n.notification_type, "reaction");
+        assert_eq!(n.reaction.as_deref(), Some("👍"));
+        assert!(n.note.is_some());
     }
 
     #[test]

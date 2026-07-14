@@ -62,13 +62,16 @@ M3 まで実装済み:
 - M3: cron スケジューラ (`.schedule("0 9 * * *", ...)`)、KV ストア
   (`ctx.store()`)、再接続 catch-up (切断中のメンションを API で補完 —
   WebSocket は切断中のイベントを replay しないため)
+- M4: `on_note(Timeline::Local, ...)` / `on_reaction` / `on_follow`
+  (+ `BotHandle::follow` で follow back)、GitHub Actions CI。
+  on_chat は notecli 側の対応待ち (ARCHITECTURE.md 参照)
 
-次は M4 (on_note / on_reaction / on_follow / on_chat + CI)。設計の詳細は
-[ARCHITECTURE.md](ARCHITECTURE.md) を参照。
+設計の詳細は [ARCHITECTURE.md](ARCHITECTURE.md) を参照。
 
 ```sh
-cargo run --example echo   # メンションをオウム返しする bot
-cargo run --example dice   # ダイスロール (@bot dice 6 3 / @bot ping)
+cargo run --example echo      # メンションをオウム返しする bot
+cargo run --example dice      # ダイスロール (@bot dice 6 3 / @bot ping)
+cargo run --example greeter   # フォローバック + リアクション集計 + TL 監視
 ```
 
 ## Docker Compose での運用

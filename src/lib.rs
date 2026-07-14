@@ -26,7 +26,7 @@ mod router;
 mod scheduler;
 pub mod store;
 
-pub use bot::{Bot, BotBuilder};
+pub use bot::{Bot, BotBuilder, ReactionEvent, Timeline};
 pub use context::{BotHandle, Ctx};
 pub use error::{NotebotError, Result};
 pub use event::BotEvent;

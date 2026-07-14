@@ -302,8 +302,13 @@ notecli と同じ流儀:
    永続化した last-seen notification id から `get_notifications(since_id)`
    で切断中のメンションを補完取得する。WebSocket は切断中のイベントを
    replay しないため、これが無いと bot は取りこぼす）
-4. **M4 (公開品質)**: on_note/on_reaction/on_follow/on_chat、examples 拡充、
-   README、CI
+4. **M4 (公開品質)**: on_note/on_reaction/on_follow、examples 拡充、
+   README、CI。**on_chat は見送り** — notecli の `stream-chat-message` は
+   per-peer の chat 購読 (`subscribe_chat_user`) からのみ発火し、bot は
+   相手を事前に知れない。main チャンネルの `newChatMessage` は汎用
+   `stream-main-event` に落ちるが payload 形状が未検証。chat 対応は
+   notecli 側に「main チャンネル経由の chat メッセージ購読」を足してから
+   (上流課題)。DM は specified ノート (mention 経由) で従来どおり扱える
 
 ## スコープ外 (v0.1 では作らない)
 

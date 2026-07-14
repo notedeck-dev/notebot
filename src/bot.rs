@@ -9,7 +9,7 @@ use std::sync::Arc;
 use notecli::api::MisskeyClient;
 use notecli::db::Database;
 use notecli::event_bus::EventBus;
-use notecli::models::{Account, NormalizedNote};
+use notecli::models::{Account, NormalizedNote, NormalizedUser, TimelineType};
 use notecli::streaming::StreamingManager;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -23,6 +23,41 @@ use crate::scheduler::{spawn_jobs, Job, ScheduleHandler};
 use crate::store::Store;
 
 type Handler = Arc<dyn Fn(Ctx) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+type ReactionHandler = Arc<
+    dyn Fn(Ctx, ReactionEvent) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
+>;
+type FollowHandler = Arc<
+    dyn Fn(BotHandle, NormalizedUser) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// 購読するタイムライン。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timeline {
+    Home,
+    Local,
+    Social,
+    Global,
+}
+
+impl Timeline {
+    fn as_str(self) -> &'static str {
+        match self {
+            Timeline::Home => "home",
+            Timeline::Local => "local",
+            Timeline::Social => "social",
+            Timeline::Global => "global",
+        }
+    }
+}
+
+/// 自分のノートに付いたリアクションの情報。
+#[derive(Debug, Clone)]
+pub struct ReactionEvent {
+    pub reaction: String,
+    pub user: Option<NormalizedUser>,
+}
 
 /// 再接続時の重複・mention/notification 二重発火を吸収する LRU 容量。
 const SEEN_CACHE_CAPACITY: usize = 1024;
@@ -36,6 +71,9 @@ pub struct BotBuilder {
     account_spec: Option<String>,
     commands: std::collections::HashMap<String, Handler>,
     on_mention: Option<Handler>,
+    on_note: Vec<(Timeline, Handler)>,
+    on_reaction: Option<ReactionHandler>,
+    on_follow: Option<FollowHandler>,
     schedules: Vec<(String, ScheduleHandler)>,
     ignore_bots: bool,
 }
@@ -56,8 +94,10 @@ impl BotBuilder {
         F: Fn(Ctx) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        self.commands
-            .insert(name.into().to_lowercase(), Arc::new(move |ctx| Box::pin(f(ctx))));
+        self.commands.insert(
+            name.into().to_lowercase(),
+            Arc::new(move |ctx| Box::pin(f(ctx))),
+        );
         self
     }
 
@@ -68,6 +108,40 @@ impl BotBuilder {
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         self.on_mention = Some(Arc::new(move |ctx| Box::pin(f(ctx))));
+        self
+    }
+
+    /// タイムラインに流れてきたノートのハンドラ。複数タイムラインを
+    /// それぞれ別ハンドラで購読できる。自分のノートと bot のノートは
+    /// フィルタされる (mention と同じ規則)。
+    pub fn on_note<F, Fut>(mut self, timeline: Timeline, f: F) -> Self
+    where
+        F: Fn(Ctx) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.on_note
+            .push((timeline, Arc::new(move |ctx| Box::pin(f(ctx)))));
+        self
+    }
+
+    /// 自分のノートにリアクションが付いたときのハンドラ。
+    /// `ctx.note()` はリアクションが付いたノート。
+    pub fn on_reaction<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(Ctx, ReactionEvent) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.on_reaction = Some(Arc::new(move |ctx, ev| Box::pin(f(ctx, ev))));
+        self
+    }
+
+    /// フォローされたときのハンドラ (follow back など)。
+    pub fn on_follow<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(BotHandle, NormalizedUser) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.on_follow = Some(Arc::new(move |bot, user| Box::pin(f(bot, user))));
         self
     }
 
@@ -112,6 +186,9 @@ impl BotBuilder {
             account_spec: self.account_spec,
             commands: self.commands,
             on_mention: self.on_mention,
+            on_note: self.on_note,
+            on_reaction: self.on_reaction,
+            on_follow: self.on_follow,
             jobs,
             ignore_bots: self.ignore_bots,
         })
@@ -122,6 +199,9 @@ pub struct Bot {
     account_spec: Option<String>,
     commands: std::collections::HashMap<String, Handler>,
     on_mention: Option<Handler>,
+    on_note: Vec<(Timeline, Handler)>,
+    on_reaction: Option<ReactionHandler>,
+    on_follow: Option<FollowHandler>,
     jobs: Vec<Job>,
     ignore_bots: bool,
 }
@@ -132,6 +212,9 @@ impl Bot {
             account_spec: None,
             commands: std::collections::HashMap::new(),
             on_mention: None,
+            on_note: Vec::new(),
+            on_reaction: None,
+            on_follow: None,
             schedules: Vec::new(),
             ignore_bots: true,
         }
@@ -152,8 +235,26 @@ impl Bot {
             Arc::new(EventBus::new()),
             db.clone(),
         );
-        manager.connect(&creds.account_id, &creds.host, &creds.token).await?;
+        manager
+            .connect(&creds.account_id, &creds.host, &creds.token)
+            .await?;
         manager.subscribe_main(&creds.account_id).await?;
+
+        // on_note のタイムラインを購読し、subscription_id → handler を記録
+        // (再接続時の replay は notecli が subscription 情報から行う)
+        let mut note_routes: std::collections::HashMap<String, Handler> =
+            std::collections::HashMap::new();
+        for (timeline, handler) in &self.on_note {
+            let sub_id = manager
+                .subscribe_timeline(
+                    &creds.account_id,
+                    TimelineType::new(timeline.as_str()),
+                    None,
+                )
+                .await?;
+            tracing::info!(timeline = timeline.as_str(), "subscribed timeline");
+            note_routes.insert(sub_id, handler.clone());
+        }
 
         let account_id = creds.account_id.clone();
         let handle = BotHandle {
@@ -178,7 +279,7 @@ impl Bot {
                 }
                 recv = rx.recv() => {
                     let Some((name, payload)) = recv else { break };
-                    self.handle_event(&name, payload, &handle, &tx, &mut seen);
+                    self.handle_event(&name, payload, &handle, &tx, &mut seen, &note_routes);
                 }
             }
         }
@@ -203,12 +304,17 @@ impl Bot {
             std::env::var("NOTEBOT_TOKEN_FILE").ok(),
         )?;
         if let Some(token) = env_token {
-            let host = std::env::var("NOTEBOT_HOST").ok().filter(|h| !h.is_empty()).ok_or_else(|| {
-                NotebotError::Config("NOTEBOT_TOKEN is set but NOTEBOT_HOST is missing".into())
-            })?;
+            let host = std::env::var("NOTEBOT_HOST")
+                .ok()
+                .filter(|h| !h.is_empty())
+                .ok_or_else(|| {
+                    NotebotError::Config("NOTEBOT_TOKEN is set but NOTEBOT_HOST is missing".into())
+                })?;
             // `i` で自分自身を取得 — トークン検証を兼ねる。user_id は
             // 自己応答ループ防止に必須
-            let me = client.request(&host, &token, "i", serde_json::json!({})).await?;
+            let me = client
+                .request(&host, &token, "i", serde_json::json!({}))
+                .await?;
             let user_id = me
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -228,7 +334,9 @@ impl Bot {
             });
         }
 
-        let spec = std::env::var("NOTEBOT_ACCOUNT").ok().or_else(|| self.account_spec.clone());
+        let spec = std::env::var("NOTEBOT_ACCOUNT")
+            .ok()
+            .or_else(|| self.account_spec.clone());
         let account = resolve_account(db, spec.as_deref())?;
         let (host, token) = notecli::get_credentials(db, &account.id)?;
         Ok(Credentials {
@@ -247,6 +355,7 @@ impl Bot {
         handle: &BotHandle,
         tx: &mpsc::UnboundedSender<(String, Value)>,
         seen: &mut SeenCache,
+        note_routes: &std::collections::HashMap<String, Handler>,
     ) {
         let Some(event) = parse_event(name, &payload) else {
             return;
@@ -260,30 +369,99 @@ impl Bot {
                 }
             }
             BotEvent::Mention(note) => {
-                if !seen.insert(&note.id) {
+                if !seen.insert(&format!("mention:{}", note.id)) {
                     return;
                 }
                 // 無視するメンションでも last id は進める —
                 // catch-up で同じノートを永遠に再取得しないため
                 record_last_mention(handle.store(), &note.id);
-                if !should_handle(&note, &handle.account.user_id, self.ignore_bots) {
+                if !should_handle(&note.user, &handle.account.user_id, self.ignore_bots) {
                     return;
                 }
                 let Some((handler, args)) = self.route(&note) else {
                     return;
                 };
-                let ctx = Ctx {
-                    bot: handle.clone(),
-                    note: *note,
-                    args,
+                spawn_handler(
+                    "mention",
+                    handler,
+                    Ctx {
+                        bot: handle.clone(),
+                        note: *note,
+                        args,
+                    },
+                );
+            }
+            BotEvent::Note {
+                subscription_id,
+                note,
+            } => {
+                // 同じノートが複数タイムラインに流れ得るため sub 単位で dedup
+                if !seen.insert(&format!("note:{subscription_id}:{}", note.id)) {
+                    return;
+                }
+                if !should_handle(&note.user, &handle.account.user_id, self.ignore_bots) {
+                    return;
+                }
+                let Some(handler) = note_routes.get(&subscription_id) else {
+                    return;
                 };
-                let note_id = ctx.note.id.clone();
-                // ハンドラは task 分離: Err/panic で bot 本体を落とさない
-                tokio::spawn(async move {
-                    if let Err(e) = handler(ctx).await {
-                        tracing::error!(note_id, error = %e, "mention handler failed");
+                spawn_handler(
+                    "note",
+                    handler.clone(),
+                    Ctx {
+                        bot: handle.clone(),
+                        note: *note,
+                        args: Vec::new(),
+                    },
+                );
+            }
+            BotEvent::Notification(n) => {
+                if !seen.insert(&format!("notif:{}", n.id)) {
+                    return;
+                }
+                if let Some(user) = &n.user {
+                    if !should_handle(user, &handle.account.user_id, self.ignore_bots) {
+                        return;
                     }
-                });
+                }
+                match n.notification_type.as_str() {
+                    "reaction" => {
+                        let Some(handler) = &self.on_reaction else {
+                            return;
+                        };
+                        // リアクション通知は対象ノートを含む
+                        let Some(note) = n.note else { return };
+                        let ev = ReactionEvent {
+                            reaction: n.reaction.unwrap_or_default(),
+                            user: n.user,
+                        };
+                        let handler = handler.clone();
+                        let ctx = Ctx {
+                            bot: handle.clone(),
+                            note,
+                            args: Vec::new(),
+                        };
+                        tokio::spawn(async move {
+                            if let Err(e) = handler(ctx, ev).await {
+                                tracing::error!(error = %e, "reaction handler failed");
+                            }
+                        });
+                    }
+                    "follow" => {
+                        let Some(handler) = &self.on_follow else {
+                            return;
+                        };
+                        let Some(user) = n.user else { return };
+                        let handler = handler.clone();
+                        let bot = handle.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handler(bot, user).await {
+                                tracing::error!(error = %e, "follow handler failed");
+                            }
+                        });
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -401,15 +579,25 @@ fn read_env_token(token: Option<String>, token_file: Option<String>) -> Result<O
 }
 
 /// 自己応答ループ防止 (解除不可) と isBot 無視 (オプトアウト可)。
-fn should_handle(note: &NormalizedNote, self_user_id: &str, ignore_bots: bool) -> bool {
-    if note.user.id == self_user_id {
+fn should_handle(user: &NormalizedUser, self_user_id: &str, ignore_bots: bool) -> bool {
+    if user.id == self_user_id {
         return false;
     }
-    if ignore_bots && note.user.is_bot {
-        tracing::debug!(note_id = note.id, "ignoring mention from bot user");
+    if ignore_bots && user.is_bot {
+        tracing::debug!(user = user.username, "ignoring event from bot user");
         return false;
     }
     true
+}
+
+/// ハンドラを task 分離で実行: Err/panic で bot 本体を落とさない。
+fn spawn_handler(kind: &'static str, handler: Handler, ctx: Ctx) {
+    let note_id = ctx.note.id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = handler(ctx).await {
+            tracing::error!(kind, note_id, error = %e, "handler failed");
+        }
+    });
 }
 
 /// notecli と同じ解決規則: `@user@host` → アカウントID → username。
@@ -465,7 +653,10 @@ fn store_path(account_id: &str) -> PathBuf {
             }
         })
         .collect();
-    data_base_dir().join("notebot").join(safe).join("store.json")
+    data_base_dir()
+        .join("notebot")
+        .join(safe)
+        .join("store.json")
 }
 
 async fn shutdown_signal() {
@@ -505,19 +696,19 @@ mod tests {
 
     #[test]
     fn own_note_is_always_ignored() {
-        assert!(!should_handle(&note("me", false), "me", false));
-        assert!(!should_handle(&note("me", false), "me", true));
+        assert!(!should_handle(&note("me", false).user, "me", false));
+        assert!(!should_handle(&note("me", false).user, "me", true));
     }
 
     #[test]
     fn bot_note_is_ignored_by_default() {
-        assert!(!should_handle(&note("other", true), "me", true));
-        assert!(should_handle(&note("other", true), "me", false));
+        assert!(!should_handle(&note("other", true).user, "me", true));
+        assert!(should_handle(&note("other", true).user, "me", false));
     }
 
     #[test]
     fn normal_mention_is_handled() {
-        assert!(should_handle(&note("other", false), "me", true));
+        assert!(should_handle(&note("other", false).user, "me", true));
     }
 
     fn seed_account(db: &Database, id: &str, username: &str, host: &str) {
@@ -542,7 +733,10 @@ mod tests {
         seed_account(&db, "a2", "bob", "other.example");
 
         assert_eq!(resolve_account(&db, None).unwrap().id, "a1");
-        assert_eq!(resolve_account(&db, Some("@bob@other.example")).unwrap().id, "a2");
+        assert_eq!(
+            resolve_account(&db, Some("@bob@other.example")).unwrap().id,
+            "a2"
+        );
         assert_eq!(resolve_account(&db, Some("a2")).unwrap().id, "a2");
         assert_eq!(resolve_account(&db, Some("BOB")).unwrap().id, "a2");
         assert!(matches!(
@@ -613,7 +807,12 @@ mod tests {
     #[test]
     fn store_path_sanitizes_account_id() {
         let path = store_path("env:u1@misskey.example");
-        let dir_name = path.parent().unwrap().file_name().unwrap().to_string_lossy();
+        let dir_name = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
         assert_eq!(dir_name, "env-u1-misskey.example");
     }
 
